@@ -97,6 +97,61 @@ interactive_input() {
     fi
 }
 
+# 创建执行脚本（通用）
+create_startup_script() {
+    local command="$1"
+    local script_path="$2"
+    
+    cat > "$script_path" << EOF
+#!/bin/bash
+# 自动生成的开机启动脚本
+# 创建于 $(date)
+
+# 设置环境变量
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# 创建日志目录
+mkdir -p /var/log/custom_startup
+LOG_FILE="/var/log/custom_startup/custom_startup.log"
+
+# 等待网络就绪
+echo "[$(date)] 等待网络就绪..." >> "\$LOG_FILE"
+sleep 20
+
+# 检查网络连接
+for i in {1..10}; do
+    if ping -c 1 -W 1 8.8.8.8 >/dev/null 2>&1; then
+        echo "[$(date)] 网络连接正常" >> "\$LOG_FILE"
+        break
+    else
+        echo "[$(date)] 网络未就绪，等待中... (\$i/10)" >> "\$LOG_FILE"
+        sleep 5
+    fi
+    if [ \$i -eq 10 ]; then
+        echo "[$(date)] 警告: 网络连接超时，继续执行..." >> "\$LOG_FILE"
+    fi
+done
+
+# 执行用户命令
+echo "[$(date)] 开始执行自定义启动命令..." >> "\$LOG_FILE"
+echo "[$(date)] 命令: $command" >> "\$LOG_FILE"
+
+# 切换到根目录，确保正确的工作目录
+cd /
+
+# 执行命令并记录输出
+{
+    echo "=== 命令开始执行 ==="
+    $command
+    echo "=== 命令执行完成，退出码: \$? ==="
+} >> "\$LOG_FILE" 2>&1
+
+echo "[$(date)] 命令执行完成" >> "\$LOG_FILE"
+EOF
+
+    chmod +x "$script_path"
+}
+
 # 添加启动命令 (Alpine)
 add_startup_alpine() {
     local command="$1"
@@ -106,23 +161,8 @@ add_startup_alpine() {
 
     echo "正在为Alpine系统配置开机启动..."
 
-    # 创建本地执行脚本
-    cat > "$local_script" << EOF
-#!/bin/sh
-# 自动生成的开机启动脚本
-# 创建于 $(date)
-
-# 等待网络就绪
-sleep 15
-
-# 执行用户命令
-echo "[$(date)] 开始执行自定义启动命令..." >> /var/log/${service_name}.log
-exec >> /var/log/${service_name}.log 2>&1
-
-$command
-EOF
-
-    chmod +x "$local_script"
+    # 创建执行脚本
+    create_startup_script "$command" "$local_script"
 
     # 创建OpenRC服务
     cat > "$service_file" << EOF
@@ -174,37 +214,27 @@ add_startup_debian() {
 
     echo "正在为Ubuntu/Debian系统配置开机启动..."
 
-    # 创建本地执行脚本
-    cat > "$local_script" << EOF
-#!/bin/bash
-# 自动生成的开机启动脚本
-# 创建于 $(date)
-
-# 等待网络就绪
-sleep 15
-
-# 执行用户命令
-echo "[$(date)] 开始执行自定义启动命令..." >> /var/log/${service_name}.log
-exec >> /var/log/${service_name}.log 2>&1
-
-$command
-EOF
-
-    chmod +x "$local_script"
+    # 创建执行脚本
+    create_startup_script "$command" "$local_script"
 
     # 创建systemd服务
     cat > "$service_file" << EOF
 [Unit]
 Description=Custom Startup Command
-After=network.target
-Wants=network.target
+After=network.target network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=root
-ExecStart=$local_script
-Restart=on-failure
+ExecStart=/bin/bash $local_script
+Restart=always
 RestartSec=10
+TimeoutStartSec=300
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=custom-startup
 
 [Install]
 WantedBy=multi-user.target
@@ -215,6 +245,9 @@ EOF
     systemctl enable "$service_name" >/dev/null 2>&1
     systemctl start "$service_name" >/dev/null 2>&1
 
+    # 等待一下让服务启动
+    sleep 2
+    
     echo "✅ Ubuntu/Debian开机启动配置完成!"
 }
 
@@ -246,9 +279,10 @@ add_startup() {
     echo ""
     echo "🎉 开机启动命令添加成功!"
     echo "📁 脚本: /usr/local/bin/custom_startup.sh"
-    echo "📊 日志: /var/log/custom_startup.log"
+    echo "📊 日志: /var/log/custom_startup/custom_startup.log"
     echo ""
-    echo "立即测试: tail -f /var/log/custom_startup.log"
+    echo "立即查看日志: tail -f /var/log/custom_startup/custom_startup.log"
+    echo "查看服务状态: systemctl status custom-startup"
 }
 
 # 移除启动命令
@@ -269,22 +303,25 @@ remove_startup() {
                 rc-update del "$service_name" default >/dev/null 2>&1
                 /etc/init.d/"$service_name" stop >/dev/null 2>&1
                 rm -f "$service_file"
+                echo "✅ Alpine服务已移除"
             fi
             ;;
         ubuntu|debian)
             local service_file="/etc/systemd/system/custom-startup.service"
-            if [ -f "$service_file" ]; then
+            if systemctl is-active custom-startup >/dev/null 2>&1; then
                 systemctl stop custom-startup >/dev/null 2>&1
                 systemctl disable custom-startup >/dev/null 2>&1
                 rm -f "$service_file"
                 systemctl daemon-reload
+                systemctl reset-failed
+                echo "✅ systemd服务已移除"
             fi
             ;;
     esac
 
     # 删除脚本和日志
     rm -f "$local_script"
-    rm -f "/var/log/${service_name}.log"
+    rm -rf "/var/log/custom_startup"
 
     echo "✅ 开机启动命令移除完成!"
 }
@@ -311,6 +348,27 @@ check_status() {
             fi
             ;;
     esac
+    
+    # 显示日志文件信息
+    if [ -f "/var/log/custom_startup/custom_startup.log" ]; then
+        echo ""
+        echo "📊 日志文件最后几行:"
+        tail -10 "/var/log/custom_startup/custom_startup.log"
+    fi
+}
+
+# 查看日志
+view_log() {
+    if [ -f "/var/log/custom_startup/custom_startup.log" ]; then
+        echo "📊 查看日志:"
+        tail -20 "/var/log/custom_startup/custom_startup.log"
+    else
+        echo "❌ 日志文件不存在"
+        echo "可能的原因:"
+        echo "1. 服务尚未运行"
+        echo "2. 服务启动失败"
+        echo "3. 日志路径: /var/log/custom_startup/custom_startup.log"
+    fi
 }
 
 # 主程序
@@ -329,6 +387,9 @@ main() {
             ;;
         status)
             check_status
+            ;;
+        log)
+            view_log
             ;;
         list)
             echo "自定义启动服务:"
